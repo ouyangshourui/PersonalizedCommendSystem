@@ -1,5 +1,6 @@
 package com.suning.spark.streaming.ppsc
 
+import java.math.MathContext
 import java.util
 import java.util.HashMap
 
@@ -7,7 +8,7 @@ import com.suning.spark.streaming.ppcs.common.RedisUtils
 import com.suning.spark.streaming.{ApplicationConstant, SparkConstant}
 import net.sf.json.JSONObject
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerConfig, ProducerRecord}
-import org.apache.spark.SparkConf
+import org.apache.spark.{SparkContext, SparkConf}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.hive.HiveContext
@@ -19,9 +20,13 @@ import scala.collection.mutable.ArrayBuffer
 /**
  * Created by 14070345 on 2015/12/7 0007.
  */
-object FixedAdvertising {
 
-  case class TempTow(cookeId: String, simGdsId: String, score: String, l4GdsGroupDd: String)
+case class TempTable(recKey: String, simGdsId: String, score: String, l4GdsGroupDd: String,userType:String)
+case class Group3IdTable( gds_cd:String,catgroup3_id:String,l1_gds_group_cd:String,brand_cd:String)
+case class memCatGroup3IdTable(member_id:String,catentry3_id:String)
+object FixedAdvertising {
+  //(recKey, simGdsId, score, l4_group ,userType)
+
 
   /**
    * Recoverable for driver failure
@@ -56,13 +61,11 @@ object FixedAdvertising {
     val arrayBuffer = new ArrayBuffer[(String, String, String, String,String)]()
     var recodeJson: JSONObject = null
     try {
-
       recodeJson = JSONObject.fromObject(recode)
       val cookieId = recodeJson.getString(ApplicationConstant.cookieId)
       val memberId = recodeJson.getString(ApplicationConstant.memberId)
       val imei = recodeJson.getString(ApplicationConstant.imei)
       val userType = recodeJson.getString(ApplicationConstant.userType)
-
       val jsonArray = recodeJson.getJSONArray(ApplicationConstant.sublist).toArray()
       jsonArray.foreach(
         recode => {
@@ -187,7 +190,7 @@ object FixedAdvertising {
    * ((recKey, simGdsId, score, l4_group ,userType)->
    * ((recKey,l3GdsGroupDd,brand_cd),(score,l4GdsGroupDd,simGdsId,l1_gds_group_cd,userType))
    */
-  def recordJoinMeta1(rdd: RDD[(String, String, String, String,String)], metaDF:DataFrame): RDD[((String, String, String), (String, String, String, String,String))] = {
+ /* def recordJoinMeta1(rdd: RDD[(String, String, String, String,String)], metaDF:DataFrame): RDD[((String, String, String), (String, String, String, String,String))] = {
     //collect recode._2 list
     val keymap = new util.HashMap[String, (String, String, String)]()
     rdd.map(r => r._2).collect().filter(!_.isEmpty).foreach(keymap.put(_, null))
@@ -196,9 +199,11 @@ object FixedAdvertising {
     while (it.hasNext) {
         val key = it.next()
         val catGroup3_idRow = metaDF.where(metaDF("gds_cd") === key).select("catgroup3_id", "l1_gds_group_cd", "brand_cd")
+         println("recordJoinMeta1:::" + key + catGroup3_idRow.count())
         if (catGroup3_idRow.count() > 0)
         {
             val catGroup3_id = catGroup3_idRow.first().getString(0)
+          println("recordJoinMeta1:::catGroup3_id " + catGroup3_id)
             val l1_gds_group_cd = catGroup3_idRow.first().getString(1)
             val brand_cd = catGroup3_idRow.first().getString(2)
             keymap.put(key, (catGroup3_id, l1_gds_group_cd, brand_cd))
@@ -208,6 +213,7 @@ object FixedAdvertising {
     val resultRDD = rdd.map { recode => {
       val catGroup3_id = keymapBC.value.get(recode._2)._1
       val l1_gds_group_cd = keymapBC.value.get(recode._2)._2
+      println("recordJoinMeta1111:::catGroup3_id " + catGroup3_id)
       val brand_cd = keymapBC.value.get(recode._2)._3
       ((recode._1, catGroup3_id, brand_cd), (recode._3, recode._4, recode._2, l1_gds_group_cd,recode._5))
     }
@@ -215,7 +221,8 @@ object FixedAdvertising {
     keymap.clear()
     keymapBC.unpersist()
     resultRDD
-  }
+  }*/
+
 
   /**
     * ((recKey,l3GdsGroupDd,brand_cd),(score,l4GdsGroupDd,simGdsId,l1_gds_group_cd,userType)) ->
@@ -288,15 +295,23 @@ object FixedAdvertising {
     // cache table
     val sqlContext = new HiveContext(ssc.sparkContext)
     // "select gds_cd,catgroup3_id from bi_dm.catgroup3Table sort by gds_cd"
-    val catGroup3TableDF = sqlContext.sql(ApplicationConstant.cacheL3GroupTableSql).cache()
-    catGroup3TableDF.count() //load to memeory
-
-    // "select member_cd,catgroup3_id from bi_dm.memOrderCatGroup3Table"
-    val memCatGroup3IdTableDF = sqlContext.sql(ApplicationConstant.catgroup3_memberIdSql).cache()
-    memCatGroup3IdTableDF.count() //load to memeory
-
+    val catGroup3TableRDD = sqlContext.sql(ApplicationConstant.cacheL3GroupTableSql).rdd.cache()
+    //load to memeory
+    catGroup3TableRDD.count()
+    val memCatGroup3IdTableRDD = sqlContext.sql(ApplicationConstant.catgroup3_memberIdSql).rdd.cache()
+    memCatGroup3IdTableRDD.count() //load to memeory
+    import sqlContext.implicits._
 
     Thread.currentThread().setContextClassLoader(FixedAdvertising.getClass.getClassLoader())
+
+
+    catGroup3TableRDD.map(p=>Group3IdTable(p.getString(0),p.getString(1),p.getString(2),p.getString(3)))
+            .toDF()
+            .registerTempTable("Group3Table")
+
+    memCatGroup3IdTableRDD.map(p=>memCatGroup3IdTable(p.getString(0),p.getString(1)))
+                         .toDF()
+                          .registerTempTable("memCatGroup3IdTable")
 
     /**
      * set kafka receiver
@@ -316,21 +331,66 @@ object FixedAdvertising {
     val ParserJsonRecode4DStream = lines.flatMap(x => {
       ParserJsonRecode(x._2)
     })
-
+   // ParserJsonRecode4DStream.print()
 
 
     /**
      * (cookeId,simGdsId,score,l4GdsGroupDd)->((cookeId,l3GdsGroupDd,brand_cd),(score,l4GdsGroupDd,simGdsId,l1_gds_group_cd))
      *
      */
+
+    /*def recordJoinMeta1(rdd: RDD[(String, String, String, String,String)], metaDF:DataFrame): RDD[((String, String, String), (String, String, String, String,String))] = {
+      //collect recode._2 list
+      val sqlContext = new org.apache.spark.sql.SQLContext(ssc.sparkContext)
+      import sqlContext.implicits._
+      val temptable= rdd.map(p=>TempTable(p._1,p._2,p._3,p._4,p._5)).toDF()
+      temptable.registerTempTable("temptable")
+      //(recKey: String, simGdsId: String, score: String, l4GdsGroupDd: String,userType:String)
+      //"select gds_cd,catgroup3_id,l1_gds_group_cd,brand_cd from bi_dm.catgroup3Table sort by gds_cd"
+      val resultDF= sqlContext.sql("select temptable.recKey,temptable.simGdsId,temptable.score,temptable.l4GdsGroupDd,temptable.userType," +
+        "Group3Table.catgroup3_id,Group3Table.l1_gds_group_cd,Group3Table.brand_cd" +
+        "from temptable join Group3Table on temptable.simGdsId=Group3Table.gds_cd")
+      // ((recode._1, catGroup3_id, brand_cd), (recode._3, recode._4, recode._2, l1_gds_group_cd,recode._5))
+      val resultRDD=resultDF.rdd.map(r=>((r.getString(0),r.getString(5),r.getString(7)), (r.getString(2),r.getString(3),r.getString(1),r.getString(6),r.getString(6))))
+      temptable.drop("temptable")
+      resultRDD
+    }
+*/
+
     val  recordJoinMetaDStream = ParserJsonRecode4DStream.transform { rdd =>
-      recordJoinMeta1(rdd,catGroup3TableDF)
+      {
+
+        val temptable= rdd.map(p=>TempTable(p._1,p._2,p._3,p._4,p._5)).toDF()
+        temptable.registerTempTable("temptable")
+        println("create table")
+        //(recKey: String, simGdsId: String, score: String, l4GdsGroupDd: String,userType:String)
+        //"select gds_cd,catgroup3_id,l1_gds_group_cd,brand_cd from bi_dm.catgroup3Table sort by gds_cd"
+        val resultDF= sqlContext.sql("select temptable.recKey,temptable.simGdsId,temptable.score,temptable.l4GdsGroupDd,temptable.userType," +
+          "Group3Table.catgroup3_id,Group3Table.l1_gds_group_cd,Group3Table.brand_cd " +
+          " from temptable join Group3Table on temptable.simGdsId=Group3Table.gds_cd ")
+        // ((recode._1, catGroup3_id, brand_cd), (recode._3, recode._4, recode._2, l1_gds_group_cd,recode._5))
+        val resultRDD=resultDF.rdd.filter(!_.isNullAt(0)).map(r=>((r.getString(0),r.getString(5),r.getString(7)),(r.getString(2),r.getString(3),r.getString(1),r.getString(6),r.getString(6))))
+        temptable.drop("temptable")
+        println("drop table")
+        resultRDD
+      }
+    }.filter(_._1 !=null)
+    recordJoinMetaDStream.print()
+
+
+
+
+    val recordFilterJoinMetaDStream = recordJoinMetaDStream.transform { rdd =>
+      recordFilterMeta(rdd,memCatGroup3IdTableDF)
     }
 
+/*
     /**
       * (cookeId,simGdsId,score,l4GdsGroupDd)->((cookeId,l3GdsGroupDd,brand_cd),(score,l4GdsGroupDd,simGdsId,l1_gds_group_cd))
       *
       */
+
+
     val recordFilterJoinMetaDStream = recordJoinMetaDStream.transform { rdd =>
       recordFilterMeta(rdd,memCatGroup3IdTableDF)
     }
@@ -368,9 +428,11 @@ object FixedAdvertising {
     val L3GroupComputeUserBrandcatScoreDStream = L3GroupBrandNumDStreamMaxScore.map(r => {
       val key = r._1 //(cookeId,simGdsId,score,l4GdsGroupDd,l3GdsGroupDd,brandNum)
       val value = r._2 //(score,l4GdsGroupDd),brandNum)
-      println("L3GroupComputeUserBrandcatScoreDStream ::" + value._1._1  + ":" )
-      val brandCatScore = (value._1._1).toFloat * (1 + ApplicationConstant.aConstant * r._2._2)
+      println("L3GroupComputeUserBrandcatScoreDStream ::" + key._1 + ":" + value._1._1  + ":"  + r._2._2)
+      var brandCatScore = (value._1._1).toDouble * (1 + ApplicationConstant.aConstant * r._2._2)
+      brandCatScore =   BigDecimal(brandCatScore).round(new MathContext(3)).toDouble
       val userBrandCatScore = if (brandCatScore > 1) 1 else brandCatScore
+
       //(key._1, key._2, value._1._1, value._1._2, value._1._3, value._2, userBrandCatScore, key._3)
       (key._1,(key._3,key._2,userBrandCatScore,value._1._4,value._1._2))
     })
@@ -401,8 +463,7 @@ object FixedAdvertising {
       }
       }
     }
-    }
-
+    }*/
     ssc.start()
     ssc.awaitTermination()
     ssc.stop()
